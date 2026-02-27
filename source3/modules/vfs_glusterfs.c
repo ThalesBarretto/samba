@@ -603,6 +603,23 @@ static uint32_t vfs_gluster_fs_capabilities(struct vfs_handle_struct *handle,
 	return caps;
 }
 
+/*
+ * FSP extension destructor — ensures the glfs_fd_t opened by
+ * vfs_gluster_openat() is closed even when vfs_gluster_close() is
+ * never reached.  This happens for directory FSPs: smb_Dir_destructor()
+ * sets fsp->fd = -1, causing fd_close() to return before calling
+ * SMB_VFS_CLOSE().  The destructor is invoked by
+ * vfs_remove_all_fsp_extensions() during file_free().
+ */
+static void vfs_gluster_fsp_ext_destroy(void *p_data)
+{
+	glfs_fd_t **glfdp = (glfs_fd_t **)p_data;
+	if (glfdp != NULL && *glfdp != NULL) {
+		glfs_close(*glfdp);
+		*glfdp = NULL;
+	}
+}
+
 static glfs_fd_t *vfs_gluster_fetch_glfd(struct vfs_handle_struct *handle,
 					 const files_struct *fsp)
 {
@@ -739,7 +756,8 @@ static int vfs_gluster_openat(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
-	p_tmp = VFS_ADD_FSP_EXTENSION(handle, fsp, glfs_fd_t *, NULL);
+	p_tmp = VFS_ADD_FSP_EXTENSION(handle, fsp, glfs_fd_t *,
+				      vfs_gluster_fsp_ext_destroy);
 	if (p_tmp == NULL) {
 		END_PROFILE(syscall_openat);
 		errno = ENOMEM;
@@ -819,7 +837,8 @@ static int vfs_gluster_openat(struct vfs_handle_struct *handle,
 
 	if (glfd == NULL) {
 		END_PROFILE(syscall_openat);
-		/* no extension destroy_fn, so no need to save errno */
+		/* glfd pointer is still NULL (talloc_zero), so the
+		 * destroy callback is a no-op and errno is preserved. */
 		VFS_REMOVE_FSP_EXTENSION(handle, fsp);
 		return -1;
 	}
@@ -844,6 +863,18 @@ static int vfs_gluster_close(struct vfs_handle_struct *handle,
 		END_PROFILE(syscall_close);
 		DBG_ERR("Failed to fetch gluster fd\n");
 		return -1;
+	}
+
+	/*
+	 * NULL the extension pointer before removing the extension,
+	 * so the destroy callback does not double-close the fd.
+	 */
+	{
+		glfs_fd_t **p = (glfs_fd_t **)VFS_FETCH_FSP_EXTENSION(
+					handle, fsp);
+		if (p != NULL) {
+			*p = NULL;
+		}
 	}
 
 	VFS_REMOVE_FSP_EXTENSION(handle, fsp);
